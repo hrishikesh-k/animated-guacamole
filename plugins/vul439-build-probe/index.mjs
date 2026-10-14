@@ -28,23 +28,63 @@ export const onPreBuild = async ({ constants }) => {
     return
   }
 
-  // Finding A: can this build token WRITE a team env var? Benign canary only.
-  const key = 'VUL439_BUILD_CANARY'
-  const url = `https://${host}/api/v1/accounts/${accountId}/env/${key}?site_id=${siteId}`
+  const auth = { Authorization: `Bearer ${token}` }
+  const body200 = (s) => `${s} (200/201 => allowed; 401/403 => blocked by authz; 422 => reached service, authz passed)`
 
+  // READ probe: does the build token reach the env API? Log KEYS ONLY and the
+  // status. Never log values, so real shared secrets do not enter the build log.
   try {
-    const write = await fetch(url, {
-      method: 'PATCH',
-      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ context: 'all', value: 'vul439-canary-written-by-build-token' }),
-    })
-    console.log('[VUL439] env-var PATCH status =', write.status, '(200 => build token CAN write team env vars)')
-
-    // Always clean up so nothing persists, regardless of write result.
-    const del = await fetch(url, { method: 'DELETE', headers: { Authorization: `Bearer ${token}` } })
-    console.log('[VUL439] canary env var cleanup status =', del.status)
+    const getUrl = `https://${host}/api/v1/accounts/${accountId}/env?site_id=${siteId}`
+    const res = await fetch(getUrl, { headers: auth })
+    let keys = '<non-JSON>'
+    try {
+      const arr = await res.clone().json()
+      keys = Array.isArray(arr) ? arr.map((v) => v.key) : '<not an array>'
+    } catch {}
+    console.log('[VUL439] env-var GET status =', res.status, body200(''))
+    console.log('[VUL439] env-var GET keys (names only) =', JSON.stringify(keys))
   } catch (err) {
-    console.log('[VUL439] env-var probe error =', err.message)
+    console.log('[VUL439] env-var GET error =', err.message)
+  }
+
+  // WRITE probe A: PATCH set_value on a canary key. Log status AND body so a
+  // 422 can be diagnosed (inactive-site vs service validation).
+  const key = 'VUL439_BUILD_CANARY'
+  const patchUrl = `https://${host}/api/v1/accounts/${accountId}/env/${key}?site_id=${siteId}`
+  try {
+    const res = await fetch(patchUrl, {
+      method: 'PATCH',
+      headers: { ...auth, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ context: 'all', value: 'vul439-canary' }),
+    })
+    const text = (await res.text()).slice(0, 400)
+    console.log('[VUL439] env-var PATCH status =', res.status, body200(''))
+    console.log('[VUL439] env-var PATCH body  =', text)
+  } catch (err) {
+    console.log('[VUL439] env-var PATCH error =', err.message)
+  }
+
+  // WRITE probe B: POST create (the documented create path). Log status + body.
+  const postUrl = `https://${host}/api/v1/accounts/${accountId}/env?site_id=${siteId}`
+  try {
+    const res = await fetch(postUrl, {
+      method: 'POST',
+      headers: { ...auth, 'Content-Type': 'application/json' },
+      body: JSON.stringify([{ key, scopes: ['builds', 'functions', 'runtime', 'post_processing'], values: [{ value: 'vul439-canary', context: 'all' }] }]),
+    })
+    const text = (await res.text()).slice(0, 400)
+    console.log('[VUL439] env-var POST status =', res.status, body200(''))
+    console.log('[VUL439] env-var POST body  =', text)
+  } catch (err) {
+    console.log('[VUL439] env-var POST error =', err.message)
+  }
+
+  // Clean up any canary this probe may have created.
+  try {
+    const del = await fetch(patchUrl, { method: 'DELETE', headers: auth })
+    console.log('[VUL439] canary cleanup status =', del.status)
+  } catch (err) {
+    console.log('[VUL439] canary cleanup error =', err.message)
   }
   console.log('[VUL439] ===== end build-token probe =====')
 }
