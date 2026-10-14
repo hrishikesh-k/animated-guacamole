@@ -6,5 +6,6 @@
 # during the build. Loaded from a path inside the repo, so a fork PR can add
 # or modify it with no registry publish.
 # empty line
+# another line
 [[plugins]]
   package = "/plugins/vul439-build-probe"
