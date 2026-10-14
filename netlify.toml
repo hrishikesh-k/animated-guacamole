@@ -1,0 +1,9 @@
+[build]
+  command = "echo no-op"
+  publish = "public"
+
+# Local build plugin: proves untrusted PR code receives NETLIFY_API_TOKEN
+# during the build. Loaded from a path inside the repo, so a fork PR can add
+# or modify it with no registry publish.
+[[plugins]]
+  package = "/plugins/vul439-build-probe"
