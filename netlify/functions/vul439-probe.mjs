@@ -43,15 +43,18 @@ export default async (req) => {
     }
   }
 
-  // ---- Blobs: seed from production, read from anywhere (cross-trust read) ----
+  // ---- Blobs cross-trust read: read the key BEFORE overwriting it, tagging
+  // the value with this deploy's own id. Call the production URL first, then the
+  // preview URL: if the preview's read-before-write shows the PRODUCTION deploy
+  // id (different from the preview's own), an untrusted preview just read data a
+  // trusted deploy wrote to the shared store. CONTEXT/DEPLOY_ID are build-time
+  // only, so we use blobs_context.deployID, which is present at runtime.
   try {
     const store = getStore('vul439-canary')
-    if (context === 'production') {
-      await store.set(SEED_KEY, `written-by-production-${process.env.DEPLOY_ID || 'unknown'}`)
-      out.blobs_seeded = true
-    }
-    // From a preview, a non-null value here = reading data a TRUSTED deploy wrote.
-    out.blobs_owner_seed_read = await store.get(SEED_KEY)
+    const myDeploy = out.blobs_context?.deployID || 'unknown'
+    out.blobs_read_before_write = await store.get(SEED_KEY)
+    await store.set(SEED_KEY, `written-by-deploy-${myDeploy}`)
+    out.blobs_wrote_as = myDeploy
   } catch (err) {
     out.blobs_error = err.message
   }
@@ -65,19 +68,25 @@ export default async (req) => {
       try {
         const r = await fetch(u, { headers: { Authorization: `Bearer ${aiKey}` } })
         let count = null
+        const text = (await r.clone().text()).slice(0, 200)
         try {
-          const j = await r.clone().json()
+          const j = JSON.parse(text)
           count = Array.isArray(j?.data) ? j.data.length : null
         } catch {}
-        return { url: u, status: r.status, model_count: count }
+        return { url: u, status: r.status, model_count: count, body_snippet: text }
       } catch (err) {
         return { url: u, error: err.message }
       }
     }
     const base = aiBase.replace(/\/$/, '')
-    out.ai_models = await tryModels(`${base}/models`)
-    if (out.ai_models.status === 404) {
-      out.ai_models_v1 = await tryModels(`${base}/v1/models`)
+    // Report the auth control (no key) alongside the authed call, so a 200 with
+    // key vs 401 without proves the key is what authenticates.
+    out.ai_models = await tryModels(`${base}/v1/models`)
+    try {
+      const noKey = await fetch(`${base}/v1/models`)
+      out.ai_models_no_key_status = noKey.status
+    } catch (err) {
+      out.ai_models_no_key_error = err.message
     }
   }
 
